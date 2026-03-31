@@ -60,7 +60,7 @@ ac-pinn-project/
 ### Local
 
 ```bash
-git clone https://github.com/your-username/ac-pinn-project.git
+git clone https://github.com/SuyashVJain/ac-pinn.git
 cd ac-pinn-project
 
 python -m venv venv
@@ -73,7 +73,7 @@ pip install -r requirements.txt
 ### Google Colab
 
 ```python
-!git clone https://github.com/your-username/ac-pinn-project.git
+!git clone https://github.com/SuyashVJain/ac-pinn.git
 %cd ac-pinn-project
 !pip install -r requirements.txt -q
 
