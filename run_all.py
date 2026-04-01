@@ -1,13 +1,4 @@
-"""
-run_all.py
-==========
-Executes the full AC-PINN notebook suite in order.
-Run from the project root:
-    python run_all.py
 
-Each notebook is executed in place and its outputs are saved.
-Results are stored in results/ and figures/ directories.
-"""
 
 import subprocess
 import sys
