@@ -1,11 +1,4 @@
-"""
-pinn_base.py
-============
-Core classes for AC-PINN: Adaptive Curriculum Physics-Informed Neural Networks
-for Stable PDE Solving under Sparse/Noisy Data.
 
-Authors : Suyash Vasal Jain, Author 2
-"""
 
 import torch
 import torch.nn as nn
@@ -17,25 +10,11 @@ import os
 from scipy.interpolate import interp1d
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DEVICE
-# ─────────────────────────────────────────────────────────────────────────────
-
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1. NOISY DATA GENERATOR
-# ─────────────────────────────────────────────────────────────────────────────
-
 class NoisyDataGenerator:
-    """
-    Generates training data for any supported PDE with controllable:
-      - sparsity  : N_ic, N_bc, N_f point counts
-      - noise     : Gaussian noise on IC/BC observations (epsilon)
-
-    Supported PDEs: 'burgers', 'heat', 'wave', 'allen_cahn'
-    """
+   
 
     SUPPORTED = ['burgers', 'heat', 'wave', 'allen_cahn']
 
@@ -43,10 +22,10 @@ class NoisyDataGenerator:
                  c=1.0, epsilon_ac=0.01, device=device):
         assert pde in self.SUPPORTED, f"PDE must be one of {self.SUPPORTED}"
         self.pde        = pde
-        self.nu         = nu          # Burgers viscosity
-        self.alpha      = alpha       # Heat diffusivity
-        self.c          = c           # Wave speed
-        self.epsilon_ac = epsilon_ac  # Allen-Cahn epsilon
+        self.nu         = nu          
+        self.alpha      = alpha       
+        self.c          = c           
+        self.epsilon_ac = epsilon_ac  
         self.device     = device
 
     def _to_t(self, a):
@@ -64,28 +43,17 @@ class NoisyDataGenerator:
             return x**2 * np.cos(np.pi * x)
 
     def _ic_dt(self, x):
-        """du/dt at t=0 — only used for wave equation (second order in t)."""
+      
         return np.zeros_like(x)
 
     def generate(self, N_ic=1000, N_bc=1000, N_f=8000, noise_eps=0.0):
-        """
-        Generate training data.
-
-        Parameters
-        ----------
-        N_ic      : number of initial condition points
-        N_bc      : number of boundary condition points
-        N_f       : number of collocation (physics) points
-        noise_eps : std of Gaussian noise added to IC/BC labels
-        """
-        # ── Initial condition ─────────────────────────────────────────────
+       
         x_ic = np.random.uniform(-1, 1, (N_ic, 1))
         t_ic = np.zeros((N_ic, 1))
         u_ic = self._ic(x_ic)
         if noise_eps > 0:
             u_ic += noise_eps * np.random.randn(*u_ic.shape)
 
-        # ── Boundary conditions ───────────────────────────────────────────
         t_bc       = np.random.uniform(0, 1, (N_bc, 1))
         half       = N_bc // 2
         x_bc_left  = -np.ones((half, 1))
@@ -98,7 +66,6 @@ class NoisyDataGenerator:
             u_bc_left  += noise_eps * np.random.randn(*u_bc_left.shape)
             u_bc_right += noise_eps * np.random.randn(*u_bc_right.shape)
 
-        # ── Collocation points ────────────────────────────────────────────
         x_f = np.random.uniform(-1, 1, (N_f, 1))
         t_f = np.random.uniform( 0, 1, (N_f, 1))
 
@@ -115,7 +82,6 @@ class NoisyDataGenerator:
             't_f': self._to_t(t_f),
         }
 
-        # Wave equation needs du/dt at t=0
         if self.pde == 'wave':
             u_ic_dt = self._ic_dt(x_ic)
             if noise_eps > 0:
@@ -128,10 +94,6 @@ class NoisyDataGenerator:
         """Return noiseless IC values for comparison plots."""
         return self._ic(x)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 2. CURRICULUM SAMPLER
-# ─────────────────────────────────────────────────────────────────────────────
 
 class CurriculumSampler:
     """
@@ -182,7 +144,6 @@ class CurriculumSampler:
         stage = self.get_stage(epoch, total_epochs)
         threshold = self.STAGE_THRESHOLDS[stage]
 
-        # Only recompute residuals every resample_every epochs
         if epoch % self.resample_every == 0:
             model.eval()
             with torch.enable_grad():
@@ -193,22 +154,18 @@ class CurriculumSampler:
             model.train()
 
         if not hasattr(self, '_scores'):
-            # First call fallback — random sample
+            
             idx = np.random.choice(self.N_pool, N_f, replace=False)
         else:
-            # Sort by difficulty (residual magnitude)
-            sorted_idx = np.argsort(self._scores)           # easy → hard
+           
+            sorted_idx = np.argsort(self._scores)           
             cutoff     = int(threshold * self.N_pool)
-            cutoff     = max(cutoff, N_f)                   # ensure enough points
+            cutoff     = max(cutoff, N_f)                   
             eligible   = sorted_idx[:cutoff]
             idx        = np.random.choice(eligible, N_f, replace=False)
 
         return self.x_pool[idx], self.t_pool[idx]
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 3. BASE PINN NETWORK
-# ─────────────────────────────────────────────────────────────────────────────
 
 class _PINNNet(nn.Module):
     """Shared MLP backbone used by both PINNSolver and ACPINNSolver."""
@@ -233,10 +190,6 @@ class _PINNNet(nn.Module):
             a = self.activation(linear(a))
         return self.linears[-1](a)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 4. PDE RESIDUAL FUNCTIONS
-# ─────────────────────────────────────────────────────────────────────────────
 
 def burgers_residual(model, x, t, nu):
     x.requires_grad_(True); t.requires_grad_(True)
@@ -302,10 +255,6 @@ PDE_PARAMS = {
     'allen_cahn': {'epsilon': 0.01},
 }
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. VANILLA PINN SOLVER
-# ─────────────────────────────────────────────────────────────────────────────
 
 class PINNSolver(nn.Module):
     """
@@ -445,21 +394,8 @@ class PINNSolver(nn.Module):
         plt.legend(); plt.grid(True); plt.tight_layout(); plt.show()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6. AC-PINN SOLVER
-# ─────────────────────────────────────────────────────────────────────────────
-
 class ACPINNSolver(PINNSolver):
-    """
-    Adaptive Curriculum PINN.
 
-    Extends PINNSolver with:
-      1. 4-stage curriculum collocation sampling
-      2. Adaptive loss weight updates
-         - 'gradient' : gradient magnitude based
-         - 'ratio'    : loss ratio based
-         - 'both'     : gradient in phase 1-2, ratio in phase 3-4
-    """
 
     def __init__(self, pde='burgers', layers=None, pde_params=None,
                  lambda_ic=1.0, lambda_bc=1.0, lambda_pde=5.0,
@@ -475,19 +411,15 @@ class ACPINNSolver(PINNSolver):
             N_pool=N_pool, resample_every=resample_every, device=device)
 
     def _update_weights_gradient(self):
-        """Gradient magnitude based adaptive weighting."""
+    
         grads = {}
         for name in ['ic', 'bc', 'pde']:
             self.network.zero_grad()
-        # Recompute individual losses to get gradients
-        # (lightweight — no curriculum sampling here)
-        return  # weights updated via ratio as fallback for simplicity
+   
+        return  
 
     def _update_weights_ratio(self, l_ic, l_bc, l_pde):
-        """
-        Loss ratio based adaptive weighting.
-        Larger loss → larger weight to balance training.
-        """
+     
         with torch.no_grad():
             total = l_ic.item() + l_bc.item() + l_pde.item() + 1e-10
             self.lambda_ic  = float(l_ic.item()  / total * 3.0)
@@ -499,11 +431,7 @@ class ACPINNSolver(PINNSolver):
             self.lambda_pde = np.clip(self.lambda_pde, 0.1, 10.0)
 
     def _update_weights_gradient_full(self, l_ic, l_bc, l_pde, optimizer):
-        """
-        Gradient magnitude based adaptive weighting.
-        Uses autograd.grad per loss term to avoid graph-freed errors
-        from sequential backward() calls.
-        """
+        
         last_layer_params = list(self.network.linears[-1].parameters())
 
         def safe_grad_norm(scalar_loss):
@@ -545,7 +473,7 @@ class ACPINNSolver(PINNSolver):
             self.network.train()
             optimizer.zero_grad()
 
-            # ── Curriculum sampling ───────────────────────────────────────
+           
             stage = self.sampler.get_stage(epoch, epochs)
 
             def _res_fn(model, x, t):
@@ -556,10 +484,9 @@ class ACPINNSolver(PINNSolver):
                 N_f=data['x_f'].shape[0]
             )
 
-            # ── Forward + loss ────────────────────────────────────────────
+          
             total, l_ic, l_bc, l_pde = self._compute_loss(data, x_f, t_f)
 
-            # ── Adaptive weight update ────────────────────────────────────
             if epoch % weight_update_every == 0 and epoch > 0:
                 use_gradient = (
                     self.weight_strategy == 'gradient' or
@@ -571,7 +498,7 @@ class ACPINNSolver(PINNSolver):
                 )
                 if use_gradient:
                     self._update_weights_gradient_full(l_ic, l_bc, l_pde, optimizer)
-                    # Recompute loss with updated weights — fresh tensors
+                  
                     optimizer.zero_grad()
                     x_f_new = x_f.detach().clone()
                     t_f_new = t_f.detach().clone()
@@ -625,12 +552,8 @@ class ACPINNSolver(PINNSolver):
         plt.tight_layout(); plt.show()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 7. FDM SOLVERS
-# ─────────────────────────────────────────────────────────────────────────────
 
 class _BaseFDM:
-    """Shared utilities for all FDM solvers."""
 
     def __init__(self, nx, nt):
         self.nx = nx; self.nt = nt
@@ -675,7 +598,6 @@ class _BaseFDM:
 
 
 class BurgersFDM(_BaseFDM):
-    """Crank-Nicolson FDM for Burgers equation."""
 
     def __init__(self, nx=256, nt=2000, nu=0.01/np.pi):
         super().__init__(nx, nt)
@@ -709,7 +631,6 @@ class BurgersFDM(_BaseFDM):
 
 
 class HeatFDM(_BaseFDM):
-    """Crank-Nicolson FDM for Heat equation: u_t = alpha * u_xx"""
 
     def __init__(self, nx=256, nt=1000, alpha=0.01):
         super().__init__(nx, nt)
@@ -739,7 +660,6 @@ class HeatFDM(_BaseFDM):
 
 
 class WaveFDM(_BaseFDM):
-    """Explicit leapfrog FDM for Wave equation: u_tt = c^2 * u_xx"""
 
     def __init__(self, nx=256, nt=2000, c=1.0):
         super().__init__(nx, nt)
@@ -766,11 +686,6 @@ class WaveFDM(_BaseFDM):
 
 
 class AllenCahnFDM(_BaseFDM):
-    """
-    Implicit-explicit (IMEX) FDM for Allen-Cahn:
-    u_t = eps^2 * u_xx + u - u^3
-    Diffusion: implicit CN, Reaction: explicit.
-    """
 
     def __init__(self, nx=256, nt=5000, epsilon=0.01):
         super().__init__(nx, nt)
@@ -808,22 +723,8 @@ FDM_SOLVERS = {
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 8. BENCHMARK
-# ─────────────────────────────────────────────────────────────────────────────
 
 class Benchmark:
-    """
-    Compare one or more PINN/AC-PINN models against an FDM ground truth.
-
-    Usage:
-        bench = Benchmark(fdm_solver)
-        bench.add('Vanilla PINN', vanilla_model)
-        bench.add('AC-PINN',      ac_model)
-        bench.run()
-        bench.compare_metrics()
-        bench.plot_comparison()
-    """
 
     def __init__(self, fdm_solver, nx=200, nt=100):
         self.fdm   = fdm_solver
@@ -942,10 +843,6 @@ class Benchmark:
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.show()
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 9. RESULTS UTILITIES
-# ─────────────────────────────────────────────────────────────────────────────
 
 def save_metrics(metrics, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
