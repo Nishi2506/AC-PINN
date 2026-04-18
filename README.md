@@ -1,6 +1,6 @@
 # AC-PINN: Adaptive Curriculum Physics-Informed Neural Networks for Stable PDE Solving under Sparse/Noisy Data
 
-**Authors:** Suyash Vasal Jain, Nishita Raghvendra, Priyal Agrawal
+**Authors:** Suyash Vasal Jain, Nishita Raghvendra
 
 ---
 
@@ -60,7 +60,7 @@ ac-pinn-project/
 ### Local
 
 ```bash
-git clone https://github.com/SuyashVJain/ac-pinn.git
+git clone https://github.com/Nishi2506/AC-PINN.git
 cd ac-pinn-project
 
 python -m venv venv
@@ -73,7 +73,7 @@ pip install -r requirements.txt
 ### Google Colab
 
 ```python
-!git clone https://github.com/SuyashVJain/ac-pinn.git
+!git clone https://github.com/Nishi2506/AC-PINN.git
 %cd ac-pinn-project
 !pip install -r requirements.txt -q
 

@@ -41,7 +41,7 @@ def run_notebook(path):
 
 def main():
     print('\nAC-PINN Full Suite Runner')
-    print('Authors: Suyash Vasal Jain, Nishita Raghvendra, Priyal Agrawal')
+    print('Authors: Suyash Vasal Jain, Nishita Raghvendra')
     print('='*60)
 
     # Ensure results/figures dirs exist
