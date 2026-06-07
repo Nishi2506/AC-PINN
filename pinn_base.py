@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import time
 import os
+import csv
 from scipy.interpolate import interp1d
 
 
@@ -853,3 +854,74 @@ def save_history(history, path):
 
 def load_history(path):
     return np.load(path, allow_pickle=True).item()
+
+
+def save_training_plots(history, save_path, label=''):
+    """Plot loss/weight/curriculum curves for a training run, save PNG + CSV."""
+    is_ac = 'lambda_ic' in history
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+
+    # Top left: total loss
+    axes[0, 0].plot(history['total'])
+    axes[0, 0].set_yscale('log')
+    axes[0, 0].set_xlabel('Epoch'); axes[0, 0].set_ylabel('Total Loss')
+    axes[0, 0].set_title('Total Loss'); axes[0, 0].grid(True)
+
+    # Top right: IC + BC + PDE loss components
+    axes[0, 1].plot(history['ic'],  label='IC')
+    axes[0, 1].plot(history['bc'],  label='BC')
+    axes[0, 1].plot(history['pde'], label='PDE')
+    axes[0, 1].set_yscale('log')
+    axes[0, 1].set_xlabel('Epoch'); axes[0, 1].set_ylabel('Loss')
+    axes[0, 1].set_title('Loss Components')
+    axes[0, 1].legend(); axes[0, 1].grid(True)
+
+    # Bottom left: adaptive loss weights (AC-PINN only)
+    if is_ac:
+        axes[1, 0].plot(history['lambda_ic'],  label='λ_ic')
+        axes[1, 0].plot(history['lambda_bc'],  label='λ_bc')
+        axes[1, 0].plot(history['lambda_pde'], label='λ_pde')
+        axes[1, 0].set_xlabel('Epoch'); axes[1, 0].set_ylabel('Weight value')
+        axes[1, 0].set_title('Adaptive Loss Weights')
+        axes[1, 0].legend(); axes[1, 0].grid(True)
+    else:
+        axes[1, 0].axis('off')
+        axes[1, 0].text(0.5, 0.5, 'N/A - Vanilla PINN', ha='center', va='center', fontsize=12)
+
+    # Bottom right: curriculum stage progression (AC-PINN only)
+    if is_ac:
+        stages = np.array(history['stage'])
+        axes[1, 1].plot(stages + 1)
+        axes[1, 1].set_xlabel('Epoch'); axes[1, 1].set_ylabel('Curriculum Stage')
+        axes[1, 1].set_title('Curriculum Stage Progression')
+        axes[1, 1].set_yticks([1, 2, 3, 4])
+        axes[1, 1].grid(True)
+    else:
+        axes[1, 1].axis('off')
+        axes[1, 1].text(0.5, 0.5, 'N/A - Vanilla PINN', ha='center', va='center', fontsize=12)
+
+    fig.suptitle(label, fontsize=14)
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.show()
+
+    # CSV with raw numbers
+    csv_path = os.path.splitext(save_path)[0] + '.csv'
+    fieldnames = ['epoch', 'total', 'ic', 'bc', 'pde']
+    if is_ac:
+        fieldnames += ['lambda_ic', 'lambda_bc', 'lambda_pde', 'stage']
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(fieldnames)
+        for i in range(len(history['total'])):
+            row = [i, history['total'][i], history['ic'][i],
+                   history['bc'][i], history['pde'][i]]
+            if is_ac:
+                row += [history['lambda_ic'][i], history['lambda_bc'][i],
+                        history['lambda_pde'][i], history['stage'][i]]
+            writer.writerow(row)
+
+    print(f'Saved: {save_path}')
+    print(f'Saved: {csv_path}')

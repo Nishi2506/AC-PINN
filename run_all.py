@@ -32,9 +32,9 @@ def run_notebook(path):
     elapsed = time.time() - start
 
     if result.returncode == 0:
-        print(f'  ✓ Done in {elapsed:.1f}s')
+        print(f'  [DONE] Done in {elapsed:.1f}s')
     else:
-        print(f'  ✗ FAILED after {elapsed:.1f}s')
+        print(f'  [FAIL] FAILED after {elapsed:.1f}s')
         print(f'  stderr: {result.stderr[-500:]}')
         return False
     return True
