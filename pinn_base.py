@@ -315,7 +315,7 @@ class PINNSolver(nn.Module):
                 self.lambda_pde * loss_pde
         return total, loss_ic, loss_bc, loss_pde
 
-    def fit(self, data, epochs=10000, lr=1e-3, print_every=500):
+    def fit(self, data, epochs=10000, lr=1e-3, print_every=500, label=''):
         optimizer = torch.optim.Adam(self.network.parameters(), lr=lr)
         scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer, step_size=3000, gamma=0.5)
@@ -336,7 +336,9 @@ class PINNSolver(nn.Module):
             history['pde'].append(l_pde.item())
 
             if epoch % print_every == 0:
-                print(f"Epoch {epoch:5d} | Total: {total.item():.6f} | "
+                prefix = f"{label} | " if label else ""
+                print(f"[{prefix}Epoch {epoch:5d}/{epochs}] "
+                      f"Total: {total.item():.6f} | "
                       f"IC: {l_ic.item():.6f} | BC: {l_bc.item():.6f} | "
                       f"PDE: {l_pde.item():.6f}")
 
@@ -448,7 +450,7 @@ class ACPINNSolver(PINNSolver):
         self.lambda_pde = float(np.clip(total_n / n_pde * 1.0, 0.1, 10.0))
 
     def fit(self, data, epochs=10000, lr=1e-3, print_every=500,
-            weight_update_every=200):
+            weight_update_every=200, label=''):
         optimizer = torch.optim.Adam(self.network.parameters(), lr=lr)
         scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer, step_size=3000, gamma=0.5)
@@ -514,7 +516,8 @@ class ACPINNSolver(PINNSolver):
             history['stage'].append(stage)
 
             if epoch % print_every == 0:
-                print(f"Epoch {epoch:5d} | Stage {stage+1}/4 | "
+                prefix = f"{label} | " if label else ""
+                print(f"[{prefix}Epoch {epoch:5d}/{epochs}] Stage {stage+1}/4 | "
                       f"Total: {total.item():.6f} | "
                       f"IC: {l_ic.item():.6f} | BC: {l_bc.item():.6f} | "
                       f"PDE: {l_pde.item():.6f} | "
