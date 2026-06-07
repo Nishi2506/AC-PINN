@@ -19,13 +19,12 @@ class NoisyDataGenerator:
     SUPPORTED = ['burgers', 'heat', 'wave', 'allen_cahn']
 
     def __init__(self, pde='burgers', nu=0.01/np.pi, alpha=0.01,
-                 c=1.0, epsilon_ac=0.01, device=device):
+                 c=1.0, device=device):
         assert pde in self.SUPPORTED, f"PDE must be one of {self.SUPPORTED}"
         self.pde        = pde
-        self.nu         = nu          
-        self.alpha      = alpha       
-        self.c          = c           
-        self.epsilon_ac = epsilon_ac  
+        self.nu         = nu
+        self.alpha      = alpha
+        self.c          = c
         self.device     = device
 
     def _to_t(self, a):
@@ -409,14 +408,6 @@ class ACPINNSolver(PINNSolver):
         self.weight_strategy = weight_strategy
         self.sampler = CurriculumSampler(
             N_pool=N_pool, resample_every=resample_every, device=device)
-
-    def _update_weights_gradient(self):
-    
-        grads = {}
-        for name in ['ic', 'bc', 'pde']:
-            self.network.zero_grad()
-   
-        return  
 
     def _update_weights_ratio(self, l_ic, l_bc, l_pde):
      
