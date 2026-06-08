@@ -371,7 +371,7 @@ class PINNSolver(nn.Module):
         c = plt.contourf(X, T, U, levels=100, cmap='jet')
         plt.colorbar(c, label='u(x,t)')
         plt.xlabel('x'); plt.ylabel('t')
-        plt.title(title or f'PINN Solution — {self.pde}')
+        plt.title(title or f'PINN Solution - {self.pde}')
         plt.tight_layout(); plt.show()
 
     def plot_loss_history(self, history):
@@ -739,7 +739,7 @@ class Benchmark:
         X, T = np.meshgrid(x_v, t_v)
         self.X, self.T = X, T
 
-        # FDM reference — interpolate if resolution differs
+        # FDM reference - interpolate if resolution differs
         step  = max(1, self.fdm.nt // self.nt)
         U_fdm = self.fdm.u[::step, :][:self.nt, :]
         if U_fdm.shape[1] != self.nx:

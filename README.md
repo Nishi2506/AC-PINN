@@ -165,7 +165,7 @@ The ablation notebook isolates:
 
 ## Results
 
-### Benchmark — Relative L2 Error vs FDM Ground Truth
+### Benchmark - Relative L2 Error vs FDM Ground Truth
 
 | PDE | Vanilla (clean) | Vanilla (noisy) | AC-PINN (clean) | AC-PINN (noisy) |
 |---|---|---|---|---|
@@ -175,10 +175,10 @@ The ablation notebook isolates:
 | Allen-Cahn | 0.1436 | 0.3164 | 0.8121 | 1.0407 |
 
 Key findings:
-- AC-PINN achieves best results on **Heat (clean)** with L2=0.00136 — 37% improvement over vanilla
+- AC-PINN achieves best results on **Heat (clean)** with L2=0.00136 - 37% improvement over vanilla
 - AC-PINN shows meaningful improvement on **Burgers (noisy)**: 0.3089 vs 0.5603 vanilla
-- **Allen-Cahn** remains challenging for both methods — stiff interface dynamics
-- Vanilla PINN outperforms AC-PINN on clean data for Burgers — curriculum adds overhead when data is abundant
+- **Allen-Cahn** remains challenging for both methods - stiff interface dynamics
+- Vanilla PINN outperforms AC-PINN on clean data for Burgers - curriculum adds overhead when data is abundant
 
 ### Ablation Study (Burgers, Noisy Sparse)
 
