@@ -7,3 +7,13 @@ venv/
 dist/
 build/
 .DS_Store
+PROJECT_CONTEXT.md
+CLAUDE_CONTEXT.md
+training_log.txt
+training_log_v2.txt
+training_log_v3.txt
+multi_seed_log.txt
+extended_noise_log.txt
+outputs/
+AC_PINN_Results.docx
+generate_results_doc.py
