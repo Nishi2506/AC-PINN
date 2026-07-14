@@ -4,6 +4,7 @@ import subprocess
 import sys
 import os
 import time
+import argparse
 
 NOTEBOOKS = [
     'notebooks/00_setup_and_verify.ipynb',
@@ -15,11 +16,18 @@ NOTEBOOKS = [
     'notebooks/06_final_comparison.ipynb',
 ]
 
-def run_notebook(path):
+def run_notebook(path, seed=None):
     print(f'\n{"="*60}')
-    print(f'  Running: {path}')
+    print(f'  Running: {path}' + (f'  (seed={seed})' if seed is not None else ''))
     print(f'{"="*60}')
     start = time.time()
+
+    env = os.environ.copy()
+    if seed is not None:
+        # Picked up by pinn_base.py at import time to seed
+        # random/numpy/torch/CUDA before the notebook runs.
+        env['PINN_SEED'] = str(seed)
+
     result = subprocess.run([
         sys.executable, '-m', 'nbconvert',
         '--to', 'notebook',
@@ -27,7 +35,7 @@ def run_notebook(path):
         '--inplace',
         '--ExecutePreprocessor.timeout=7200',  # 2 hour timeout per notebook
         path
-    ], capture_output=True, text=True)
+    ], capture_output=True, text=True, env=env)
 
     elapsed = time.time() - start
 
@@ -40,8 +48,19 @@ def run_notebook(path):
     return True
 
 def main():
+    parser = argparse.ArgumentParser(description='Run the full AC-PINN notebook suite.')
+    parser.add_argument('--seed', type=int, default=None,
+                         help='Optional seed applied to every notebook via '
+                              'the PINN_SEED environment variable (see '
+                              'pinn_base.set_seed). For running the same '
+                              'experiment N times with different seeds, '
+                              'use multi_seed_run.py instead.')
+    args = parser.parse_args()
+
     print('\nAC-PINN Full Suite Runner')
     print('Authors: Suyash Vasal Jain, Nishita Raghvendra')
+    if args.seed is not None:
+        print(f'Seed: {args.seed}')
     print('='*60)
 
     # Ensure results/figures dirs exist
@@ -57,7 +76,7 @@ def main():
         if not os.path.exists(nb):
             print(f'  WARNING: {nb} not found, skipping.')
             continue
-        success = run_notebook(nb)
+        success = run_notebook(nb, seed=args.seed)
         if not success:
             failed.append(nb)
             print(f'  Stopping suite due to failure in {nb}')

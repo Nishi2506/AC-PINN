@@ -8,10 +8,29 @@ import matplotlib.gridspec as gridspec
 import time
 import os
 import csv
+import random
 from scipy.interpolate import interp1d
 
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+def set_seed(seed):
+    """Set all relevant RNG seeds (random, numpy, torch, CUDA) for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+
+# If PINN_SEED is set in the environment, seed everything at import time.
+# This lets an external driver (e.g. multi_seed_run.py) reproduce a given
+# seed for an entire notebook run without having to modify the notebook.
+_env_seed = os.environ.get('PINN_SEED')
+if _env_seed is not None:
+    set_seed(int(_env_seed))
 
 
 class NoisyDataGenerator:
@@ -97,23 +116,62 @@ class NoisyDataGenerator:
 
 class CurriculumSampler:
     """
-    4-stage residual-based curriculum sampler.
+    n-stage residual-based curriculum sampler (4 stages by default).
 
+    With n_stages=4 (default):
     Stage 1 (0–25%)   : easiest 25% of points by residual magnitude
     Stage 2 (25–50%)  : easiest 50%
     Stage 3 (50–75%)  : easiest 75%
     Stage 4 (75–100%) : full domain
 
+    In general, the n_stages difficulty bands and fixed-epoch fractions
+    are split equally: [1/n_stages, 2/n_stages, ..., 1.0].
+
     Points are re-sampled every `resample_every` epochs based on
     current model residuals → truly adaptive.
+
+    Stage ADVANCEMENT (i.e. when to move from one difficulty band to the
+    next) can work in two modes:
+
+    - dynamic_curriculum=True (default): a stage advances once the mean
+      PDE residual over the last `N_window` collocation points drops
+      below `stage_thresholds[stage] * initial_residual`, where
+      `initial_residual` is the mean residual measured at the start of
+      training. Each stage must also last at least `min_epochs_per_stage`
+      epochs before it's allowed to advance. If the residual never drops
+      enough, the sampler falls back to the fixed epoch fractions of
+      `total_epochs` so training can't stall in an early stage forever.
+      `stage_thresholds` must have `n_stages - 1` entries (one per
+      possible transition); if not given, a default decreasing sequence
+      from 0.5 to 0.05 is generated automatically.
+    - dynamic_curriculum=False: stages advance purely at the fixed epoch
+      fractions, matching the original behavior.
     """
 
-    STAGE_THRESHOLDS = [0.25, 0.50, 0.75, 1.00]
-
-    def __init__(self, N_pool=20000, resample_every=500, device=device):
+    def __init__(self, N_pool=20000, resample_every=500, device=device,
+                 dynamic_curriculum=True, stage_thresholds=None,
+                 min_epochs_per_stage=500, N_window=200, n_stages=4):
+        assert n_stages >= 2, "n_stages must be at least 2"
         self.N_pool         = N_pool
         self.resample_every = resample_every
         self.device         = device
+
+        self.dynamic_curriculum = dynamic_curriculum
+        self.n_stages           = n_stages
+        # Difficulty cutoff (fraction of pool) and fixed-mode / fallback
+        # epoch fractions, split equally across n_stages: [1/n, ..., 1.0]
+        self.STAGE_THRESHOLDS  = [ (i + 1) / n_stages for i in range(n_stages) ]
+        self.FIXED_EPOCH_FRACS = list(self.STAGE_THRESHOLDS)
+
+        if stage_thresholds is None:
+            stage_thresholds = list(np.geomspace(0.5, 0.05, n_stages - 1))
+        else:
+            assert len(stage_thresholds) == n_stages - 1, (
+                f"stage_thresholds must have n_stages-1={n_stages-1} "
+                f"entries, got {len(stage_thresholds)}")
+        self.stage_thresholds     = stage_thresholds
+        self.min_epochs_per_stage = min_epochs_per_stage
+        self.N_window             = N_window
 
         # Pre-generate large candidate pool
         x_pool = np.random.uniform(-1, 1, (N_pool, 1))
@@ -121,15 +179,95 @@ class CurriculumSampler:
         self.x_pool = torch.tensor(x_pool, dtype=torch.float32).to(device)
         self.t_pool = torch.tensor(t_pool, dtype=torch.float32).to(device)
 
-    def get_stage(self, epoch, total_epochs):
-        """Return current stage index (0–3) based on training progress."""
-        progress = epoch / total_epochs
-        for i, threshold in enumerate(self.STAGE_THRESHOLDS):
-            if progress <= threshold:
-                return i
-        return 3
+        # Dynamic stage-tracking state
+        self._stage             = 0
+        self._stage_start_epoch = 0
+        self._initial_residual  = None
+        self.stage_transitions  = []  # [{from_stage, to_stage, epoch, residual, fallback}, ...]
 
-    def sample(self, model, pde_residual_fn, epoch, total_epochs, N_f=8000):
+        # Resample-gap tracking (so plateau-triggered resampling never
+        # fires more often than `resample_every`, and epoch 0 always
+        # triggers an initial resample)
+        self._last_resample_epoch = -resample_every
+
+    def get_stage(self, epoch, total_epochs):
+        """Return current stage index (0 to n_stages-1) based on training progress."""
+        if not self.dynamic_curriculum:
+            progress = epoch / total_epochs
+            for i, frac in enumerate(self.FIXED_EPOCH_FRACS):
+                if progress <= frac:
+                    return i
+            return self.n_stages - 1
+        return self._stage
+
+    def _maybe_advance_stage(self, epoch, total_epochs, mean_residual=None):
+        """
+        Residual-driven stage advancement with fixed-epoch fallback.
+
+        `mean_residual=None` means "no fresh residual score this call" --
+        used for the every-epoch fallback-only check (called
+        unconditionally from ACPINNSolver.fit(), regardless of whether a
+        resample happened this epoch) so the fixed-epoch fallback can
+        never be delayed past a resample event. The residual-based check
+        still only runs when a real `mean_residual` is supplied, i.e.
+        from sample() right after residual scores are recomputed.
+        """
+        if self._stage >= self.n_stages - 1:
+            return
+
+        if mean_residual is not None and self._initial_residual is None:
+            self._initial_residual = mean_residual + 1e-12
+
+        epochs_in_stage = epoch - self._stage_start_epoch
+        if epochs_in_stage < self.min_epochs_per_stage:
+            return
+
+        progress     = epoch / total_epochs
+        fallback_due = progress >= self.FIXED_EPOCH_FRACS[self._stage]
+
+        residual_met = False
+        if mean_residual is not None and self._initial_residual is not None:
+            threshold    = self.stage_thresholds[self._stage] * self._initial_residual
+            residual_met = mean_residual < threshold
+
+        if residual_met or fallback_due:
+            self.stage_transitions.append({
+                'from_stage': self._stage,
+                'to_stage':   self._stage + 1,
+                'epoch':      epoch,
+                'residual':   float(mean_residual) if mean_residual is not None else None,
+                'fallback':   bool(fallback_due and not residual_met),
+            })
+            self._stage += 1
+            self._stage_start_epoch = epoch
+
+    def should_resample(self, epoch, adaptive_resample=True, plateau_detected=False):
+        """
+        Decide whether residual scores should be recomputed this epoch.
+
+        `resample_every` always acts as a minimum gap between resamples,
+        regardless of mode:
+        - adaptive_resample=True : resample when `plateau_detected` is True
+          (as determined by the caller from its own loss history), but
+          never more often than every `resample_every` epochs.
+        - adaptive_resample=False: resample every `resample_every` epochs,
+          matching the original fixed-interval behavior.
+        """
+        gap_ok = (epoch - self._last_resample_epoch) >= self.resample_every
+        if not gap_ok:
+            return False
+
+        if adaptive_resample:
+            do_resample = plateau_detected
+        else:
+            do_resample = (epoch % self.resample_every == 0)
+
+        if do_resample:
+            self._last_resample_epoch = epoch
+        return do_resample
+
+    def sample(self, model, pde_residual_fn, epoch, total_epochs, N_f=8000,
+               force_resample=False):
         """
         Sample N_f collocation points according to current curriculum stage.
 
@@ -140,27 +278,35 @@ class CurriculumSampler:
         epoch           : current epoch
         total_epochs    : total training epochs
         N_f             : number of points to return
+        force_resample  : recompute residual scores this epoch regardless
+                           of any internal schedule (caller-driven, e.g.
+                           fixed-interval or loss-plateau detection)
         """
-        stage = self.get_stage(epoch, total_epochs)
-        threshold = self.STAGE_THRESHOLDS[stage]
-
-        if epoch % self.resample_every == 0:
+        if force_resample or not hasattr(self, '_scores'):
             model.eval()
             with torch.enable_grad():
                 x_p = self.x_pool.clone().requires_grad_(True)
                 t_p = self.t_pool.clone().requires_grad_(True)
                 res = pde_residual_fn(model, x_p, t_p)
-                self._scores = torch.abs(res).detach().squeeze().cpu().numpy()
+                abs_res = torch.abs(res).detach().squeeze()
+                self._scores = abs_res.cpu().numpy()
             model.train()
 
+            if self.dynamic_curriculum:
+                mean_residual = float(abs_res[:self.N_window].mean().item())
+                self._maybe_advance_stage(epoch, total_epochs, mean_residual)
+
+        stage     = self.get_stage(epoch, total_epochs)
+        threshold = self.STAGE_THRESHOLDS[stage]
+
         if not hasattr(self, '_scores'):
-            
+
             idx = np.random.choice(self.N_pool, N_f, replace=False)
         else:
-           
-            sorted_idx = np.argsort(self._scores)           
+
+            sorted_idx = np.argsort(self._scores)
             cutoff     = int(threshold * self.N_pool)
-            cutoff     = max(cutoff, N_f)                   
+            cutoff     = max(cutoff, N_f)
             eligible   = sorted_idx[:cutoff]
             idx        = np.random.choice(eligible, N_f, replace=False)
 
@@ -316,7 +462,10 @@ class PINNSolver(nn.Module):
                 self.lambda_pde * loss_pde
         return total, loss_ic, loss_bc, loss_pde
 
-    def fit(self, data, epochs=10000, lr=1e-3, print_every=500, label=''):
+    def fit(self, data, epochs=10000, lr=1e-3, print_every=500, label='', seed=None):
+        if seed is not None:
+            set_seed(seed)
+
         optimizer = torch.optim.Adam(self.network.parameters(), lr=lr)
         scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer, step_size=3000, gamma=0.5)
@@ -376,8 +525,9 @@ class PINNSolver(nn.Module):
 
     def plot_loss_history(self, history):
         plt.figure(figsize=(10, 5))
-        for key, vals in history.items():
-            plt.plot(vals, label=key.upper() + ' Loss')
+        for key in ['total', 'ic', 'bc', 'pde']:
+            if key in history:
+                plt.plot(history[key], label=key.upper() + ' Loss')
         plt.yscale('log'); plt.xlabel('Epoch'); plt.ylabel('Loss')
         plt.title('Training Loss Curves')
         plt.legend(); plt.grid(True); plt.tight_layout(); plt.show()
@@ -403,14 +553,33 @@ class ACPINNSolver(PINNSolver):
                  lambda_ic=1.0, lambda_bc=1.0, lambda_pde=5.0,
                  weight_strategy='gradient',
                  N_pool=20000, resample_every=500,
+                 dynamic_curriculum=True,
+                 stage_thresholds=None,
+                 min_epochs_per_stage=500,
+                 switch_eval_every=1000,
+                 min_epochs_before_switch=2000,
+                 n_stages=4,
                  device=device):
         super().__init__(pde=pde, layers=layers, pde_params=pde_params,
                          lambda_ic=lambda_ic, lambda_bc=lambda_bc,
                          lambda_pde=lambda_pde, device=device)
-        assert weight_strategy in ['gradient', 'ratio', 'both']
+        assert weight_strategy in ['gradient', 'ratio', 'both', 'auto']
         self.weight_strategy = weight_strategy
+        self.dynamic_curriculum = dynamic_curriculum
+        if stage_thresholds is None and n_stages == 4:
+            stage_thresholds = [0.5, 0.2, 0.05]  # preserve original default
         self.sampler = CurriculumSampler(
-            N_pool=N_pool, resample_every=resample_every, device=device)
+            N_pool=N_pool, resample_every=resample_every, device=device,
+            dynamic_curriculum=dynamic_curriculum,
+            stage_thresholds=stage_thresholds,
+            min_epochs_per_stage=min_epochs_per_stage,
+            n_stages=n_stages)
+
+        # 'auto' mode: dynamically switch between 'ratio' and 'gradient'
+        self.switch_eval_every        = switch_eval_every
+        self.min_epochs_before_switch = min_epochs_before_switch
+        self._current_auto_strategy   = 'ratio'
+        self._strategy_history        = {'ratio': [], 'gradient': []}
 
     def _update_weights_ratio(self, l_ic, l_bc, l_pde):
      
@@ -450,8 +619,69 @@ class ACPINNSolver(PINNSolver):
         self.lambda_bc  = float(np.clip(total_n / n_bc  * 1.0, 0.1, 10.0))
         self.lambda_pde = float(np.clip(total_n / n_pde * 1.0, 0.1, 10.0))
 
+    def _switch_auto_strategy(self, epoch, from_strategy, to_strategy, reason, history):
+        self._current_auto_strategy = to_strategy
+        history['weight_strategy_log'].append({
+            'epoch':          epoch,
+            'from_strategy':  from_strategy,
+            'to_strategy':    to_strategy,
+            'reason':         reason,
+        })
+
+    def _evaluate_auto_strategy(self, epoch, history):
+        """
+        Every `switch_eval_every` epochs (once `min_epochs_before_switch`
+        has elapsed), compare the current strategy's loss reduction over
+        the last `switch_eval_every` epochs against the other strategy's
+        historical average reduction, and switch if the other strategy
+        has performed better on average. If the other strategy has no
+        recorded performance yet, switch to it once to gather a baseline.
+        """
+        window = history['total'][-self.switch_eval_every:]
+        if len(window) < self.switch_eval_every:
+            return
+
+        current = self._current_auto_strategy
+        other   = 'gradient' if current == 'ratio' else 'ratio'
+
+        reduction = (window[0] - window[-1]) / self.switch_eval_every
+        self._strategy_history[current].append(reduction)
+
+        if not self._strategy_history[other]:
+            reason = f"exploring '{other}' (no historical data yet)"
+            self._switch_auto_strategy(epoch, current, other, reason, history)
+            return
+
+        other_avg = sum(self._strategy_history[other]) / len(self._strategy_history[other])
+        if other_avg > reduction:
+            reason = (f"'{other}' historical avg reduction {other_avg:.6g} "
+                      f"> '{current}' last-window reduction {reduction:.6g}")
+            self._switch_auto_strategy(epoch, current, other, reason, history)
+
+    @staticmethod
+    def _loss_plateau_detected(total_history, plateau_window, plateau_tol):
+        """
+        True once the moving average of total loss over the last
+        `plateau_window` epochs improves by less than `plateau_tol`
+        relative to the moving average over the `plateau_window` epochs
+        before that.
+        """
+        if len(total_history) < 2 * plateau_window:
+            return False
+        recent   = total_history[-plateau_window:]
+        previous = total_history[-2 * plateau_window:-plateau_window]
+        prev_avg = sum(previous) / plateau_window
+        curr_avg = sum(recent) / plateau_window
+        improvement = prev_avg - curr_avg
+        return improvement < plateau_tol
+
     def fit(self, data, epochs=10000, lr=1e-3, print_every=500,
-            weight_update_every=200, label=''):
+            weight_update_every=200, label='',
+            adaptive_resample=True, plateau_window=200, plateau_tol=1e-4,
+            seed=None):
+        if seed is not None:
+            set_seed(seed)
+
         optimizer = torch.optim.Adam(self.network.parameters(), lr=lr)
         scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer, step_size=3000, gamma=0.5)
@@ -459,7 +689,7 @@ class ACPINNSolver(PINNSolver):
         history = {
             'total': [], 'ic': [], 'bc': [], 'pde': [],
             'lambda_ic': [], 'lambda_bc': [], 'lambda_pde': [],
-            'stage': []
+            'stage': [], 'stage_transitions': [], 'weight_strategy_log': []
         }
         start = time.time()
 
@@ -467,28 +697,50 @@ class ACPINNSolver(PINNSolver):
             self.network.train()
             optimizer.zero_grad()
 
-           
+            if self.sampler.dynamic_curriculum:
+                # Fallback-only check, every epoch, independent of whether
+                # a resample happens this epoch -- so the fixed-epoch
+                # fallback can never be delayed past a resample event.
+                # (Residual-based advancement still only happens inside
+                # sample() when a fresh residual score is computed.)
+                self.sampler._maybe_advance_stage(epoch, epochs)
+
             stage = self.sampler.get_stage(epoch, epochs)
+
+            if (self.weight_strategy == 'auto' and epoch > 0
+                    and epoch >= self.min_epochs_before_switch
+                    and epoch % self.switch_eval_every == 0):
+                self._evaluate_auto_strategy(epoch, history)
 
             def _res_fn(model, x, t):
                 return self.residual_fn(model, x, t, **self.pde_params)
 
+            plateau_detected = adaptive_resample and self._loss_plateau_detected(
+                history['total'], plateau_window, plateau_tol)
+            do_resample = self.sampler.should_resample(
+                epoch, adaptive_resample=adaptive_resample,
+                plateau_detected=plateau_detected)
+
             x_f, t_f = self.sampler.sample(
                 self.network, _res_fn, epoch, epochs,
-                N_f=data['x_f'].shape[0]
+                N_f=data['x_f'].shape[0], force_resample=do_resample
             )
 
           
             total, l_ic, l_bc, l_pde = self._compute_loss(data, x_f, t_f)
 
             if epoch % weight_update_every == 0 and epoch > 0:
+                active_strategy = (
+                    self._current_auto_strategy
+                    if self.weight_strategy == 'auto' else self.weight_strategy
+                )
                 use_gradient = (
-                    self.weight_strategy == 'gradient' or
-                    (self.weight_strategy == 'both' and stage < 2)
+                    active_strategy == 'gradient' or
+                    (active_strategy == 'both' and stage < 2)
                 )
                 use_ratio = (
-                    self.weight_strategy == 'ratio' or
-                    (self.weight_strategy == 'both' and stage >= 2)
+                    active_strategy == 'ratio' or
+                    (active_strategy == 'both' and stage >= 2)
                 )
                 if use_gradient:
                     self._update_weights_gradient_full(l_ic, l_bc, l_pde, optimizer)
@@ -518,11 +770,14 @@ class ACPINNSolver(PINNSolver):
 
             if epoch % print_every == 0:
                 prefix = f"{label} | " if label else ""
-                print(f"[{prefix}Epoch {epoch:5d}/{epochs}] Stage {stage+1}/4 | "
+                print(f"[{prefix}Epoch {epoch:5d}/{epochs}] "
+                      f"Stage {stage+1}/{self.sampler.n_stages} | "
                       f"Total: {total.item():.6f} | "
                       f"IC: {l_ic.item():.6f} | BC: {l_bc.item():.6f} | "
                       f"PDE: {l_pde.item():.6f} | "
-                      f"λ=({self.lambda_ic:.2f},{self.lambda_bc:.2f},{self.lambda_pde:.2f})")
+                      f"lam=({self.lambda_ic:.2f},{self.lambda_bc:.2f},{self.lambda_pde:.2f})")
+
+        history['stage_transitions'] = self.sampler.stage_transitions
 
         self.runtime = time.time() - start
         print(f"\nAC-PINN training complete in {self.runtime:.2f}s")
@@ -541,11 +796,286 @@ class ACPINNSolver(PINNSolver):
         axes[1].plot(stages + 1)
         axes[1].set_xlabel('Epoch'); axes[1].set_ylabel('Curriculum Stage')
         axes[1].set_title('Curriculum Stage Progression')
-        axes[1].set_yticks([1, 2, 3, 4])
+        axes[1].set_yticks(range(1, int(stages.max()) + 2))
         axes[1].grid(True)
 
         plt.tight_layout(); plt.show()
 
+    def plot_curriculum_stages(self, history, data, save_path):
+        """
+        Scatter-plot the training collocation points over the (x, t)
+        domain, colored by which curriculum stage first made each point
+        eligible for sampling (stage 0 = easiest, n_stages-1 = hardest).
+
+        Since the sampler only keeps its most recent residual snapshot
+        (not a per-epoch history of which point entered at which epoch),
+        "first introduced in" is reconstructed by re-scoring
+        `data['x_f']`/`data['t_f']` with the final trained network and
+        mapping each point's difficulty rank through the same
+        `STAGE_THRESHOLDS` cutoffs used during training. The epoch/residual
+        of each actual stage transition (from `history['stage_transitions']`)
+        is annotated alongside the plot for context.
+        """
+        x_f = data['x_f'].detach().cpu().numpy().flatten()
+        t_f = data['t_f'].detach().cpu().numpy().flatten()
+
+        self.network.eval()
+        x_t = data['x_f'].clone().requires_grad_(True)
+        t_t = data['t_f'].clone().requires_grad_(True)
+        with torch.enable_grad():
+            res = self.residual_fn(self.network, x_t, t_t, **self.pde_params)
+            scores = torch.abs(res).detach().cpu().numpy().flatten()
+        self.network.train()
+
+        n_points   = len(scores)
+        n_stages   = self.sampler.n_stages
+        thresholds = np.array(self.sampler.STAGE_THRESHOLDS)
+
+        sorted_idx = np.argsort(scores)              # ascending difficulty
+        rank       = np.empty(n_points, dtype=int)
+        rank[sorted_idx] = np.arange(n_points)
+        fracs = (rank + 1) / n_points
+
+        point_stage = np.searchsorted(thresholds, fracs, side='left')
+        point_stage = np.clip(point_stage, 0, n_stages - 1)
+
+        fig, ax = plt.subplots(figsize=(9, 6))
+        cmap = plt.get_cmap('viridis', n_stages)
+        sc = ax.scatter(x_f, t_f, c=point_stage, cmap=cmap,
+                         vmin=-0.5, vmax=n_stages - 0.5, s=10, alpha=0.7)
+        cbar = fig.colorbar(sc, ax=ax, ticks=range(n_stages))
+        cbar.set_label(f'Curriculum stage first introduced '
+                        f'(0=easy .. {n_stages-1}=hard)')
+
+        transitions = history.get('stage_transitions', [])
+        if transitions:
+            lines = []
+            for t in transitions:
+                residual_str = (f"{t['residual']:.4g}" if t.get('residual') is not None
+                                 else 'N/A')
+                fallback_str = ', fallback' if t.get('fallback') else ''
+                lines.append(
+                    f"Stage {t['from_stage']}→{t['to_stage']} @ epoch {t['epoch']} "
+                    f"(residual={residual_str}{fallback_str})"
+                )
+            fig.text(0.99, 0.02, '\n'.join(lines), fontsize=7,
+                     ha='right', va='bottom', transform=fig.transFigure)
+
+        ax.set_xlabel('x'); ax.set_ylabel('t')
+        ax.set_title('Curriculum Stage Introduction Map')
+        plt.tight_layout()
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.show()
+        print(f'Saved: {save_path}')
+
+
+class SAWeightPINN(PINNSolver):
+    """
+    Self-Adaptive PINN (SA-PINN), Wang et al. 2022.
+
+    The IC/BC/PDE loss-term weights are trainable parameters (softmax
+    normalized so they always sum to 3, matching the default
+    lambda_ic + lambda_bc + lambda_pde = 3 scale of the vanilla PINN).
+    The network minimizes the weighted loss while the weights themselves
+    are updated by GRADIENT ASCENT on that same loss -- an adversarial
+    min-max game where terms the network is fitting poorly get pushed to
+    higher weight automatically.
+    """
+
+    def __init__(self, pde='burgers', layers=None, pde_params=None,
+                 lambda_ic=1.0, lambda_bc=1.0, lambda_pde=5.0,
+                 weight_lr=1e-3, device=device):
+        super().__init__(pde=pde, layers=layers, pde_params=pde_params,
+                          lambda_ic=lambda_ic, lambda_bc=lambda_bc,
+                          lambda_pde=lambda_pde, device=device)
+        self.weight_lr = weight_lr
+        init_logits = torch.log(torch.tensor(
+            [lambda_ic, lambda_bc, lambda_pde], dtype=torch.float32))
+        self.raw_weights = nn.Parameter(init_logits.to(device))
+
+    def _softmax_weights(self):
+        w = torch.softmax(self.raw_weights, dim=0) * 3.0
+        return w[0], w[1], w[2]
+
+    def _compute_loss(self, data, x_f=None, t_f=None):
+        mse = nn.MSELoss()
+
+        u_pred_ic = self.network(data['x_ic'], data['t_ic'])
+        loss_ic   = mse(u_pred_ic, data['u_ic'])
+
+        u_pred_left  = self.network(data['x_bc_left'],  data['t_bc_left'])
+        u_pred_right = self.network(data['x_bc_right'], data['t_bc_right'])
+        loss_bc = mse(u_pred_left,  data['u_bc_left']) + \
+                  mse(u_pred_right, data['u_bc_right'])
+
+        if self.pde == 'wave' and 'u_ic_dt' in data:
+            x_ic_ = data['x_ic'].clone().requires_grad_(True)
+            t_ic_ = data['t_ic'].clone().requires_grad_(True)
+            u_    = self.network(x_ic_, t_ic_)
+            u_t_  = torch.autograd.grad(u_, t_ic_,
+                        grad_outputs=torch.ones_like(u_),
+                        create_graph=True)[0]
+            loss_ic = loss_ic + mse(u_t_, data['u_ic_dt'])
+
+        xf = data['x_f'] if x_f is None else x_f
+        tf = data['t_f'] if t_f is None else t_f
+        xf = xf.clone().requires_grad_(True)
+        tf = tf.clone().requires_grad_(True)
+        f_pred   = self.residual_fn(self.network, xf, tf, **self.pde_params)
+        loss_pde = mse(f_pred, torch.zeros_like(f_pred))
+
+        w_ic, w_bc, w_pde = self._softmax_weights()
+        self.lambda_ic  = float(w_ic.item())
+        self.lambda_bc  = float(w_bc.item())
+        self.lambda_pde = float(w_pde.item())
+
+        total = w_ic * loss_ic + w_bc * loss_bc + w_pde * loss_pde
+        return total, loss_ic, loss_bc, loss_pde
+
+    def fit(self, data, epochs=10000, lr=1e-3, print_every=500, label=''):
+        optimizer_net = torch.optim.Adam(self.network.parameters(), lr=lr)
+        optimizer_w   = torch.optim.Adam([self.raw_weights], lr=self.weight_lr)
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer_net, step_size=3000, gamma=0.5)
+        history = {
+            'total': [], 'ic': [], 'bc': [], 'pde': [],
+            'lambda_ic': [], 'lambda_bc': [], 'lambda_pde': []
+        }
+        start = time.time()
+
+        for epoch in range(epochs):
+            self.network.train()
+            optimizer_net.zero_grad()
+            optimizer_w.zero_grad()
+
+            total, l_ic, l_bc, l_pde = self._compute_loss(data)
+            total.backward()
+
+            # Network descends the weighted loss...
+            optimizer_net.step()
+            # ...while the weight logits ascend it (adversarial min-max):
+            # flip the sign of the gradient the shared backward() already
+            # computed for raw_weights, then step with a normal (descent)
+            # optimizer.
+            self.raw_weights.grad.neg_()
+            optimizer_w.step()
+
+            scheduler.step()
+
+            history['total'].append(total.item())
+            history['ic'].append(l_ic.item())
+            history['bc'].append(l_bc.item())
+            history['pde'].append(l_pde.item())
+            history['lambda_ic'].append(self.lambda_ic)
+            history['lambda_bc'].append(self.lambda_bc)
+            history['lambda_pde'].append(self.lambda_pde)
+
+            if epoch % print_every == 0:
+                prefix = f"{label} | " if label else ""
+                print(f"[{prefix}Epoch {epoch:5d}/{epochs}] "
+                      f"Total: {total.item():.6f} | "
+                      f"IC: {l_ic.item():.6f} | BC: {l_bc.item():.6f} | "
+                      f"PDE: {l_pde.item():.6f} | "
+                      f"w=({self.lambda_ic:.2f},{self.lambda_bc:.2f},{self.lambda_pde:.2f})")
+
+        self.runtime = time.time() - start
+        print(f"\nSA-PINN training complete in {self.runtime:.2f}s")
+        return history
+
+
+class RARPINNSolver(PINNSolver):
+    """
+    RAR-PINN (Residual-based Adaptive Refinement), Lu et al. 2021 (DeepXDE).
+
+    Loss weights are fixed, exactly like the vanilla PINN. Every
+    `rar_update_every` epochs, the PDE residual is evaluated on a fresh
+    dense candidate grid (`rar_pool_size` random points) and the
+    `rar_k` highest-residual points are ADDED to the collocation set --
+    points are only appended, never replaced or removed, up to a cap of
+    `rar_max_points`.
+    """
+
+    def __init__(self, pde='burgers', layers=None, pde_params=None,
+                 lambda_ic=1.0, lambda_bc=1.0, lambda_pde=5.0,
+                 rar_update_every=1000, rar_k=50, rar_pool_size=10000,
+                 rar_max_points=20000, device=device):
+        super().__init__(pde=pde, layers=layers, pde_params=pde_params,
+                          lambda_ic=lambda_ic, lambda_bc=lambda_bc,
+                          lambda_pde=lambda_pde, device=device)
+        self.rar_update_every = rar_update_every
+        self.rar_k            = rar_k
+        self.rar_pool_size    = rar_pool_size
+        self.rar_max_points   = rar_max_points
+
+    def _rar_add_points(self, x_f, t_f):
+        """Evaluate the residual on a fresh dense random grid and append
+        the rar_k highest-residual points to the (x_f, t_f) collocation
+        set, capped at rar_max_points."""
+        self.network.eval()
+        x_pool = torch.tensor(
+            np.random.uniform(-1, 1, (self.rar_pool_size, 1)),
+            dtype=torch.float32).to(self.device).requires_grad_(True)
+        t_pool = torch.tensor(
+            np.random.uniform(0, 1, (self.rar_pool_size, 1)),
+            dtype=torch.float32).to(self.device).requires_grad_(True)
+        with torch.enable_grad():
+            res    = self.residual_fn(self.network, x_pool, t_pool, **self.pde_params)
+            scores = torch.abs(res).detach().squeeze()
+        self.network.train()
+
+        top_idx = torch.argsort(scores, descending=True)[:self.rar_k]
+        x_new = x_pool[top_idx].detach()
+        t_new = t_pool[top_idx].detach()
+
+        x_f = torch.cat([x_f, x_new], dim=0)
+        t_f = torch.cat([t_f, t_new], dim=0)
+        if x_f.shape[0] > self.rar_max_points:
+            x_f = x_f[-self.rar_max_points:]
+            t_f = t_f[-self.rar_max_points:]
+        return x_f, t_f
+
+    def fit(self, data, epochs=10000, lr=1e-3, print_every=500, label=''):
+        optimizer = torch.optim.Adam(self.network.parameters(), lr=lr)
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=3000, gamma=0.5)
+        history = {
+            'total': [], 'ic': [], 'bc': [], 'pde': [], 'n_collocation': []
+        }
+        start = time.time()
+
+        x_f = data['x_f'].clone()
+        t_f = data['t_f'].clone()
+
+        for epoch in range(epochs):
+            self.network.train()
+
+            if epoch > 0 and epoch % self.rar_update_every == 0:
+                x_f, t_f = self._rar_add_points(x_f, t_f)
+
+            optimizer.zero_grad()
+            total, l_ic, l_bc, l_pde = self._compute_loss(data, x_f, t_f)
+            total.backward()
+            optimizer.step()
+            scheduler.step()
+
+            history['total'].append(total.item())
+            history['ic'].append(l_ic.item())
+            history['bc'].append(l_bc.item())
+            history['pde'].append(l_pde.item())
+            history['n_collocation'].append(x_f.shape[0])
+
+            if epoch % print_every == 0:
+                prefix = f"{label} | " if label else ""
+                print(f"[{prefix}Epoch {epoch:5d}/{epochs}] "
+                      f"Total: {total.item():.6f} | "
+                      f"IC: {l_ic.item():.6f} | BC: {l_bc.item():.6f} | "
+                      f"PDE: {l_pde.item():.6f} | "
+                      f"N_f: {x_f.shape[0]}")
+
+        self.runtime = time.time() - start
+        print(f"\nRAR-PINN training complete in {self.runtime:.2f}s")
+        return history
 
 
 class _BaseFDM:
@@ -858,7 +1388,12 @@ def load_history(path):
 
 def save_training_plots(history, save_path, label=''):
     """Plot loss/weight/curriculum curves for a training run, save PNG + CSV."""
-    is_ac = 'lambda_ic' in history
+    # NOTE: 'lambda_ic' alone is NOT a reliable AC-PINN indicator -- SAWeightPINN
+    # histories also carry lambda_ic/bc/pde (its learned softmax weights) but
+    # have no 'stage' key, since it has no curriculum. Check each panel's own
+    # required key independently instead of one combined is_ac flag.
+    has_weights = 'lambda_ic' in history
+    has_stage   = 'stage' in history
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 9))
 
@@ -877,29 +1412,29 @@ def save_training_plots(history, save_path, label=''):
     axes[0, 1].set_title('Loss Components')
     axes[0, 1].legend(); axes[0, 1].grid(True)
 
-    # Bottom left: adaptive loss weights (AC-PINN only)
-    if is_ac:
-        axes[1, 0].plot(history['lambda_ic'],  label='λ_ic')
-        axes[1, 0].plot(history['lambda_bc'],  label='λ_bc')
-        axes[1, 0].plot(history['lambda_pde'], label='λ_pde')
+    # Bottom left: adaptive/learned loss weights (AC-PINN and SA-PINN)
+    if has_weights:
+        axes[1, 0].plot(history['lambda_ic'],  label='lambda_ic')
+        axes[1, 0].plot(history['lambda_bc'],  label='lambda_bc')
+        axes[1, 0].plot(history['lambda_pde'], label='lambda_pde')
         axes[1, 0].set_xlabel('Epoch'); axes[1, 0].set_ylabel('Weight value')
         axes[1, 0].set_title('Adaptive Loss Weights')
         axes[1, 0].legend(); axes[1, 0].grid(True)
     else:
         axes[1, 0].axis('off')
-        axes[1, 0].text(0.5, 0.5, 'N/A - Vanilla PINN', ha='center', va='center', fontsize=12)
+        axes[1, 0].text(0.5, 0.5, 'N/A - fixed loss weights', ha='center', va='center', fontsize=12)
 
     # Bottom right: curriculum stage progression (AC-PINN only)
-    if is_ac:
+    if has_stage:
         stages = np.array(history['stage'])
         axes[1, 1].plot(stages + 1)
         axes[1, 1].set_xlabel('Epoch'); axes[1, 1].set_ylabel('Curriculum Stage')
         axes[1, 1].set_title('Curriculum Stage Progression')
-        axes[1, 1].set_yticks([1, 2, 3, 4])
+        axes[1, 1].set_yticks(range(1, int(stages.max()) + 2))
         axes[1, 1].grid(True)
     else:
         axes[1, 1].axis('off')
-        axes[1, 1].text(0.5, 0.5, 'N/A - Vanilla PINN', ha='center', va='center', fontsize=12)
+        axes[1, 1].text(0.5, 0.5, 'N/A - no curriculum stages', ha='center', va='center', fontsize=12)
 
     fig.suptitle(label, fontsize=14)
     plt.tight_layout()
@@ -910,17 +1445,21 @@ def save_training_plots(history, save_path, label=''):
     # CSV with raw numbers
     csv_path = os.path.splitext(save_path)[0] + '.csv'
     fieldnames = ['epoch', 'total', 'ic', 'bc', 'pde']
-    if is_ac:
-        fieldnames += ['lambda_ic', 'lambda_bc', 'lambda_pde', 'stage']
+    if has_weights:
+        fieldnames += ['lambda_ic', 'lambda_bc', 'lambda_pde']
+    if has_stage:
+        fieldnames += ['stage']
     with open(csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(fieldnames)
         for i in range(len(history['total'])):
             row = [i, history['total'][i], history['ic'][i],
                    history['bc'][i], history['pde'][i]]
-            if is_ac:
+            if has_weights:
                 row += [history['lambda_ic'][i], history['lambda_bc'][i],
-                        history['lambda_pde'][i], history['stage'][i]]
+                        history['lambda_pde'][i]]
+            if has_stage:
+                row += [history['stage'][i]]
             writer.writerow(row)
 
     print(f'Saved: {save_path}')
