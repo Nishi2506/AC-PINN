@@ -25,14 +25,6 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-# If PINN_SEED is set in the environment, seed everything at import time.
-# This lets an external driver (e.g. multi_seed_run.py) reproduce a given
-# seed for an entire notebook run without having to modify the notebook.
-_env_seed = os.environ.get('PINN_SEED')
-if _env_seed is not None:
-    set_seed(int(_env_seed))
-
-
 class NoisyDataGenerator:
    
 
