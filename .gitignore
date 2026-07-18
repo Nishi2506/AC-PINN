@@ -17,3 +17,4 @@ extended_noise_log.txt
 outputs/
 AC_PINN_Results.docx
 generate_results_doc.py
+run_full_chain.ps1

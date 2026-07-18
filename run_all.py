@@ -91,5 +91,8 @@ def main():
         print(f'  All notebooks ran successfully.')
     print(f'{"="*60}\n')
 
+    if failed:
+        sys.exit(1)
+
 if __name__ == '__main__':
     main()

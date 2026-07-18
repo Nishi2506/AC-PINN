@@ -551,6 +551,7 @@ class ACPINNSolver(PINNSolver):
                  switch_eval_every=1000,
                  min_epochs_before_switch=2000,
                  n_stages=4,
+                 ntk_init=False,
                  device=device):
         super().__init__(pde=pde, layers=layers, pde_params=pde_params,
                          lambda_ic=lambda_ic, lambda_bc=lambda_bc,
@@ -567,26 +568,32 @@ class ACPINNSolver(PINNSolver):
             min_epochs_per_stage=min_epochs_per_stage,
             n_stages=n_stages)
 
-        # 'auto' mode: dynamically switch between 'ratio' and 'gradient'
+        # 'auto' mode: momentum-blend between 'ratio' and 'gradient'
+        # weighting (Wang et al. 2021 LR-annealing style) rather than a
+        # hard switch -- alpha is the ratio-side blend coefficient.
         self.switch_eval_every        = switch_eval_every
         self.min_epochs_before_switch = min_epochs_before_switch
-        self._current_auto_strategy   = 'ratio'
+        self._auto_alpha              = 0.5
         self._strategy_history        = {'ratio': [], 'gradient': []}
 
-    def _update_weights_ratio(self, l_ic, l_bc, l_pde):
-     
+        # NTK-based initial weighting (Wang et al. 2022): if True, rescale
+        # the initial lambda_ic/lambda_bc so their last-layer gradient
+        # norms match lambda_pde's, computed once at the start of fit().
+        self.ntk_init = ntk_init
+
+    def _compute_ratio_weights_values(self, l_ic, l_bc, l_pde):
+        """Loss-ratio weighting: return (w_ic, w_bc, w_pde) without
+        mutating self.lambda_* -- callers assign or blend as needed."""
         with torch.no_grad():
             total = l_ic.item() + l_bc.item() + l_pde.item() + 1e-10
-            self.lambda_ic  = float(l_ic.item()  / total * 3.0)
-            self.lambda_bc  = float(l_bc.item()  / total * 3.0)
-            self.lambda_pde = float(l_pde.item() / total * 3.0)
-            # Clamp to reasonable range
-            self.lambda_ic  = np.clip(self.lambda_ic,  0.1, 10.0)
-            self.lambda_bc  = np.clip(self.lambda_bc,  0.1, 10.0)
-            self.lambda_pde = np.clip(self.lambda_pde, 0.1, 10.0)
+            w_ic  = np.clip(l_ic.item()  / total * 3.0, 0.1, 10.0)
+            w_bc  = np.clip(l_bc.item()  / total * 3.0, 0.1, 10.0)
+            w_pde = np.clip(l_pde.item() / total * 3.0, 0.1, 10.0)
+        return float(w_ic), float(w_bc), float(w_pde)
 
-    def _update_weights_gradient_full(self, l_ic, l_bc, l_pde, optimizer):
-        
+    def _compute_gradient_weights_values(self, l_ic, l_bc, l_pde):
+        """Gradient-norm weighting: return (w_ic, w_bc, w_pde) without
+        mutating self.lambda_* -- callers assign or blend as needed."""
         last_layer_params = list(self.network.linears[-1].parameters())
 
         def safe_grad_norm(scalar_loss):
@@ -607,48 +614,111 @@ class ACPINNSolver(PINNSolver):
         n_pde   = safe_grad_norm(l_pde)
         total_n = n_ic + n_bc + n_pde
 
-        self.lambda_ic  = float(np.clip(total_n / n_ic  * 1.0, 0.1, 10.0))
-        self.lambda_bc  = float(np.clip(total_n / n_bc  * 1.0, 0.1, 10.0))
-        self.lambda_pde = float(np.clip(total_n / n_pde * 1.0, 0.1, 10.0))
+        w_ic  = np.clip(total_n / n_ic  * 1.0, 0.1, 10.0)
+        w_bc  = np.clip(total_n / n_bc  * 1.0, 0.1, 10.0)
+        w_pde = np.clip(total_n / n_pde * 1.0, 0.1, 10.0)
+        return float(w_ic), float(w_bc), float(w_pde)
 
-    def _switch_auto_strategy(self, epoch, from_strategy, to_strategy, reason, history):
-        self._current_auto_strategy = to_strategy
-        history['weight_strategy_log'].append({
-            'epoch':          epoch,
-            'from_strategy':  from_strategy,
-            'to_strategy':    to_strategy,
-            'reason':         reason,
-        })
+    def _update_weights_ratio(self, l_ic, l_bc, l_pde):
+        self.lambda_ic, self.lambda_bc, self.lambda_pde = \
+            self._compute_ratio_weights_values(l_ic, l_bc, l_pde)
 
-    def _evaluate_auto_strategy(self, epoch, history):
+    def _update_weights_gradient_full(self, l_ic, l_bc, l_pde, optimizer):
+        self.lambda_ic, self.lambda_bc, self.lambda_pde = \
+            self._compute_gradient_weights_values(l_ic, l_bc, l_pde)
+
+    def _update_weights_auto_blend(self, l_ic, l_bc, l_pde, optimizer):
+        """
+        'auto' strategy (Wang et al. 2021 LR-annealing style): instead of
+        hard-switching between the ratio and gradient-norm weighting
+        rules, blend them with the running coefficient `self._auto_alpha`
+        (nudged over time by `_evaluate_auto_blend`):
+            weight = alpha * ratio_weight + (1 - alpha) * gradient_weight
+        """
+        ratio_ic, ratio_bc, ratio_pde = self._compute_ratio_weights_values(l_ic, l_bc, l_pde)
+        grad_ic,  grad_bc,  grad_pde  = self._compute_gradient_weights_values(l_ic, l_bc, l_pde)
+
+        alpha = self._auto_alpha
+        self.lambda_ic  = float(alpha * ratio_ic  + (1 - alpha) * grad_ic)
+        self.lambda_bc  = float(alpha * ratio_bc  + (1 - alpha) * grad_bc)
+        self.lambda_pde = float(alpha * ratio_pde + (1 - alpha) * grad_pde)
+
+    def _evaluate_auto_blend(self, epoch, history):
         """
         Every `switch_eval_every` epochs (once `min_epochs_before_switch`
-        has elapsed), compare the current strategy's loss reduction over
-        the last `switch_eval_every` epochs against the other strategy's
-        historical average reduction, and switch if the other strategy
-        has performed better on average. If the other strategy has no
-        recorded performance yet, switch to it once to gather a baseline.
+        has elapsed), nudge the ratio/gradient blend coefficient
+        `self._auto_alpha` by +/-0.1 based on which side has performed
+        better recently, instead of hard-switching between strategies.
+        `alpha` is clamped to [0.1, 0.9] so neither term is ever fully
+        switched off. Comparison mirrors the original hard-switch logic:
+        the currently-dominant side's loss reduction over the last
+        `switch_eval_every` epochs is compared against the other side's
+        historical average reduction; if no historical data exists yet
+        for the other side, alpha nudges toward it once to explore.
         """
         window = history['total'][-self.switch_eval_every:]
         if len(window) < self.switch_eval_every:
             return
 
-        current = self._current_auto_strategy
-        other   = 'gradient' if current == 'ratio' else 'ratio'
+        side  = 'ratio' if self._auto_alpha >= 0.5 else 'gradient'
+        other = 'gradient' if side == 'ratio' else 'ratio'
 
         reduction = (window[0] - window[-1]) / self.switch_eval_every
-        self._strategy_history[current].append(reduction)
+        self._strategy_history[side].append(reduction)
 
-        if not self._strategy_history[other]:
-            reason = f"exploring '{other}' (no historical data yet)"
-            self._switch_auto_strategy(epoch, current, other, reason, history)
-            return
+        if self._strategy_history[other]:
+            other_avg     = sum(self._strategy_history[other]) / len(self._strategy_history[other])
+            ratio_perf    = reduction  if side == 'ratio' else other_avg
+            gradient_perf = other_avg  if side == 'ratio' else reduction
+            ratio_better  = ratio_perf >= gradient_perf
+        else:
+            # No data yet for the other side -- nudge toward it once to
+            # start gathering a baseline (mirrors the original exploration step).
+            ratio_better = (side == 'gradient')
 
-        other_avg = sum(self._strategy_history[other]) / len(self._strategy_history[other])
-        if other_avg > reduction:
-            reason = (f"'{other}' historical avg reduction {other_avg:.6g} "
-                      f"> '{current}' last-window reduction {reduction:.6g}")
-            self._switch_auto_strategy(epoch, current, other, reason, history)
+        old_alpha = self._auto_alpha
+        direction = 0.1 if ratio_better else -0.1
+        self._auto_alpha = float(np.clip(self._auto_alpha + direction, 0.1, 0.9))
+
+        history['weight_strategy_log'].append({
+            'epoch':       epoch,
+            'alpha_before': old_alpha,
+            'alpha_after':  self._auto_alpha,
+            'nudged_toward': 'ratio' if direction > 0 else 'gradient',
+        })
+
+    def _apply_ntk_init(self, data):
+        """
+        NTK-based initial loss weighting (Wang et al. 2022): PINNs can
+        fail to train when the NTK eigenvalues of the IC/BC/PDE loss
+        terms are badly mismatched at initialization. As a simple fix,
+        rescale the initial lambda_ic/lambda_bc so their last-layer
+        gradient norms match lambda_pde's gradient norm -- lambda_pde
+        itself is left at its configured value. Called once, before the
+        training loop starts, when `self.ntk_init=True`.
+        """
+        _, l_ic, l_bc, l_pde = self._compute_loss(data)
+        last_layer_params = list(self.network.linears[-1].parameters())
+
+        def safe_grad_norm(scalar_loss):
+            try:
+                grads = torch.autograd.grad(
+                    scalar_loss, last_layer_params,
+                    retain_graph=True, allow_unused=True
+                )
+                total_norm = sum(
+                    g.norm(2).item()**2 for g in grads if g is not None
+                )
+                return total_norm**0.5 + 1e-10
+            except Exception:
+                return 1.0
+
+        n_ic  = safe_grad_norm(l_ic)
+        n_bc  = safe_grad_norm(l_bc)
+        n_pde = safe_grad_norm(l_pde)
+
+        self.lambda_ic = float(np.clip(n_pde / n_ic, 0.1, 10.0))
+        self.lambda_bc = float(np.clip(n_pde / n_bc, 0.1, 10.0))
 
     @staticmethod
     def _loss_plateau_detected(total_history, plateau_window, plateau_tol):
@@ -683,6 +753,10 @@ class ACPINNSolver(PINNSolver):
             'lambda_ic': [], 'lambda_bc': [], 'lambda_pde': [],
             'stage': [], 'stage_transitions': [], 'weight_strategy_log': []
         }
+
+        if self.ntk_init:
+            self._apply_ntk_init(data)
+
         start = time.time()
 
         for epoch in range(epochs):
@@ -702,7 +776,7 @@ class ACPINNSolver(PINNSolver):
             if (self.weight_strategy == 'auto' and epoch > 0
                     and epoch >= self.min_epochs_before_switch
                     and epoch % self.switch_eval_every == 0):
-                self._evaluate_auto_strategy(epoch, history)
+                self._evaluate_auto_blend(epoch, history)
 
             def _res_fn(model, x, t):
                 return self.residual_fn(model, x, t, **self.pde_params)
@@ -722,10 +796,7 @@ class ACPINNSolver(PINNSolver):
             total, l_ic, l_bc, l_pde = self._compute_loss(data, x_f, t_f)
 
             if epoch % weight_update_every == 0 and epoch > 0:
-                active_strategy = (
-                    self._current_auto_strategy
-                    if self.weight_strategy == 'auto' else self.weight_strategy
-                )
+                active_strategy = self.weight_strategy
                 use_gradient = (
                     active_strategy == 'gradient' or
                     (active_strategy == 'both' and stage < 2)
@@ -734,9 +805,10 @@ class ACPINNSolver(PINNSolver):
                     active_strategy == 'ratio' or
                     (active_strategy == 'both' and stage >= 2)
                 )
+                use_auto = (active_strategy == 'auto')
                 if use_gradient:
                     self._update_weights_gradient_full(l_ic, l_bc, l_pde, optimizer)
-                  
+
                     optimizer.zero_grad()
                     x_f_new = x_f.detach().clone()
                     t_f_new = t_f.detach().clone()
@@ -746,6 +818,13 @@ class ACPINNSolver(PINNSolver):
                     total = self.lambda_ic  * l_ic + \
                             self.lambda_bc  * l_bc + \
                             self.lambda_pde * l_pde
+                elif use_auto:
+                    self._update_weights_auto_blend(l_ic, l_bc, l_pde, optimizer)
+
+                    optimizer.zero_grad()
+                    x_f_new = x_f.detach().clone()
+                    t_f_new = t_f.detach().clone()
+                    total, l_ic, l_bc, l_pde = self._compute_loss(data, x_f_new, t_f_new)
 
             total.backward()
             optimizer.step()
@@ -864,30 +943,34 @@ class ACPINNSolver(PINNSolver):
 
 class SAWeightPINN(PINNSolver):
     """
-    Self-Adaptive PINN (SA-PINN), Wang et al. 2022.
+    Self-Adaptive PINN (SA-PINN), McClenny & Braga-Neto 2021.
 
-    The IC/BC/PDE loss-term weights are trainable parameters (softmax
-    normalized so they always sum to 3, matching the default
-    lambda_ic + lambda_bc + lambda_pde = 3 scale of the vanilla PINN).
-    The network minimizes the weighted loss while the weights themselves
-    are updated by GRADIENT ASCENT on that same loss -- an adversarial
-    min-max game where terms the network is fitting poorly get pushed to
-    higher weight automatically.
+    A true saddle-point (min-max) formulation: the network parameters
+    theta are updated by gradient DESCENT on the weighted loss (via
+    `theta_optimizer`, i.e. the inherited `network` optimizer), while the
+    adaptation weights lambda are updated by gradient ASCENT on that same
+    loss (via a separate `lambda_optimizer` with its own, higher, learning
+    rate) -- terms the network is fitting poorly get pushed to higher
+    weight automatically. lambda is parameterized as softplus(raw_weights)
+    rather than softmax: softplus keeps every weight independently
+    positive with no forced normalization, so the terms don't compete
+    against each other the way a softmax's fixed-sum constraint would
+    (increasing one weight no longer mechanically decreases the others).
     """
 
     def __init__(self, pde='burgers', layers=None, pde_params=None,
                  lambda_ic=1.0, lambda_bc=1.0, lambda_pde=5.0,
-                 weight_lr=1e-3, device=device):
+                 weight_lr=1e-2, device=device):
         super().__init__(pde=pde, layers=layers, pde_params=pde_params,
                           lambda_ic=lambda_ic, lambda_bc=lambda_bc,
                           lambda_pde=lambda_pde, device=device)
         self.weight_lr = weight_lr
-        init_logits = torch.log(torch.tensor(
-            [lambda_ic, lambda_bc, lambda_pde], dtype=torch.float32))
-        self.raw_weights = nn.Parameter(init_logits.to(device))
+        # lambda initialized to ones (raw parameter, pre-softplus), not
+        # zeros -- so every term starts with a meaningful positive weight.
+        self.raw_weights = nn.Parameter(torch.ones(3, dtype=torch.float32).to(device))
 
-    def _softmax_weights(self):
-        w = torch.softmax(self.raw_weights, dim=0) * 3.0
+    def _softplus_weights(self):
+        w = nn.functional.softplus(self.raw_weights)
         return w[0], w[1], w[2]
 
     def _compute_loss(self, data, x_f=None, t_f=None):
@@ -917,7 +1000,7 @@ class SAWeightPINN(PINNSolver):
         f_pred   = self.residual_fn(self.network, xf, tf, **self.pde_params)
         loss_pde = mse(f_pred, torch.zeros_like(f_pred))
 
-        w_ic, w_bc, w_pde = self._softmax_weights()
+        w_ic, w_bc, w_pde = self._softplus_weights()
         self.lambda_ic  = float(w_ic.item())
         self.lambda_bc  = float(w_bc.item())
         self.lambda_pde = float(w_pde.item())
@@ -926,10 +1009,14 @@ class SAWeightPINN(PINNSolver):
         return total, loss_ic, loss_bc, loss_pde
 
     def fit(self, data, epochs=10000, lr=1e-3, print_every=500, label=''):
-        optimizer_net = torch.optim.Adam(self.network.parameters(), lr=lr)
-        optimizer_w   = torch.optim.Adam([self.raw_weights], lr=self.weight_lr)
+        # Separate optimizers with separate learning rates, per the true
+        # saddle-point formulation: theta descends (lr, default 1e-3),
+        # lambda ascends (self.weight_lr, default 1e-2 -- higher, since
+        # the adaptation weights should react faster than the network).
+        theta_optimizer  = torch.optim.Adam(self.network.parameters(), lr=lr)
+        lambda_optimizer = torch.optim.Adam([self.raw_weights], lr=self.weight_lr)
         scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer_net, step_size=3000, gamma=0.5)
+            theta_optimizer, step_size=3000, gamma=0.5)
         history = {
             'total': [], 'ic': [], 'bc': [], 'pde': [],
             'lambda_ic': [], 'lambda_bc': [], 'lambda_pde': []
@@ -938,20 +1025,20 @@ class SAWeightPINN(PINNSolver):
 
         for epoch in range(epochs):
             self.network.train()
-            optimizer_net.zero_grad()
-            optimizer_w.zero_grad()
+            theta_optimizer.zero_grad()
+            lambda_optimizer.zero_grad()
 
             total, l_ic, l_bc, l_pde = self._compute_loss(data)
             total.backward()
 
-            # Network descends the weighted loss...
-            optimizer_net.step()
-            # ...while the weight logits ascend it (adversarial min-max):
-            # flip the sign of the gradient the shared backward() already
-            # computed for raw_weights, then step with a normal (descent)
-            # optimizer.
+            # theta descends the weighted loss...
+            theta_optimizer.step()
+            # ...while lambda ascends it (true saddle point / adversarial
+            # min-max): flip the sign of the gradient the shared
+            # backward() already computed for raw_weights, then step with
+            # a normal (descent) optimizer -- equivalent to ascent.
             self.raw_weights.grad.neg_()
-            optimizer_w.step()
+            lambda_optimizer.step()
 
             scheduler.step()
 
@@ -982,16 +1069,19 @@ class RARPINNSolver(PINNSolver):
 
     Loss weights are fixed, exactly like the vanilla PINN. Every
     `rar_update_every` epochs, the PDE residual is evaluated on a fresh
-    dense candidate grid (`rar_pool_size` random points) and the
-    `rar_k` highest-residual points are ADDED to the collocation set --
-    points are only appended, never replaced or removed, up to a cap of
-    `rar_max_points`.
+    dense candidate grid (`rar_pool_size` random points, default 10000 --
+    matching the DeepXDE paper); if the mean residual over that pool
+    exceeds the threshold `E0` (default 0.005, matching the paper), the
+    `rar_k` highest-residual points (default 40, matching the paper) are
+    ADDED to the collocation set -- points are only appended, never
+    replaced or removed, up to a cap of `rar_max_points`. If the mean
+    residual is already below `E0`, no points are added this update.
     """
 
     def __init__(self, pde='burgers', layers=None, pde_params=None,
                  lambda_ic=1.0, lambda_bc=1.0, lambda_pde=5.0,
-                 rar_update_every=1000, rar_k=50, rar_pool_size=10000,
-                 rar_max_points=20000, device=device):
+                 rar_update_every=1000, rar_k=40, rar_pool_size=10000,
+                 rar_max_points=20000, E0=0.005, device=device):
         super().__init__(pde=pde, layers=layers, pde_params=pde_params,
                           lambda_ic=lambda_ic, lambda_bc=lambda_bc,
                           lambda_pde=lambda_pde, device=device)
@@ -999,11 +1089,15 @@ class RARPINNSolver(PINNSolver):
         self.rar_k            = rar_k
         self.rar_pool_size    = rar_pool_size
         self.rar_max_points   = rar_max_points
+        self.E0                = E0
 
     def _rar_add_points(self, x_f, t_f):
-        """Evaluate the residual on a fresh dense random grid and append
-        the rar_k highest-residual points to the (x_f, t_f) collocation
-        set, capped at rar_max_points."""
+        """Evaluate the residual on a fresh dense random grid; if the mean
+        residual over that pool exceeds `self.E0`, append the rar_k
+        highest-residual points to the (x_f, t_f) collocation set, capped
+        at rar_max_points. If the mean residual is already <= E0, the
+        pool is considered adequately resolved and no points are added
+        (matches the DeepXDE RAR criterion, Lu et al. 2021)."""
         self.network.eval()
         x_pool = torch.tensor(
             np.random.uniform(-1, 1, (self.rar_pool_size, 1)),
@@ -1015,6 +1109,10 @@ class RARPINNSolver(PINNSolver):
             res    = self.residual_fn(self.network, x_pool, t_pool, **self.pde_params)
             scores = torch.abs(res).detach().squeeze()
         self.network.train()
+
+        mean_residual = float(scores.mean().item())
+        if mean_residual <= self.E0:
+            return x_f, t_f
 
         top_idx = torch.argsort(scores, descending=True)[:self.rar_k]
         x_new = x_pool[top_idx].detach()
@@ -1068,6 +1166,73 @@ class RARPINNSolver(PINNSolver):
         self.runtime = time.time() - start
         print(f"\nRAR-PINN training complete in {self.runtime:.2f}s")
         return history
+
+
+class GPINNSolver(PINNSolver):
+    """
+    gPINN (Gradient-enhanced PINN), Yu et al. 2022.
+
+    Identical to the vanilla PINN except the loss also penalizes the
+    spatial and temporal gradients of the PDE residual itself,
+    ||grad_x r||^2 and ||grad_t r||^2, weighted by `lambda_g`. A small
+    residual at the sampled collocation points doesn't guarantee the
+    residual stays small between them; penalizing the residual's own
+    gradient encourages it to be flat (not just pointwise small),
+    which tends to tighten the PDE-consistency of the solution across
+    the whole domain rather than only at sampled points.
+    """
+
+    def __init__(self, pde='burgers', layers=None, pde_params=None,
+                 lambda_ic=1.0, lambda_bc=1.0, lambda_pde=5.0,
+                 lambda_g=0.1, device=device):
+        super().__init__(pde=pde, layers=layers, pde_params=pde_params,
+                          lambda_ic=lambda_ic, lambda_bc=lambda_bc,
+                          lambda_pde=lambda_pde, device=device)
+        self.lambda_g = lambda_g
+
+    def _compute_loss(self, data, x_f=None, t_f=None):
+        mse = nn.MSELoss()
+
+        # IC loss
+        u_pred_ic = self.network(data['x_ic'], data['t_ic'])
+        loss_ic   = mse(u_pred_ic, data['u_ic'])
+
+        # BC loss
+        u_pred_left  = self.network(data['x_bc_left'],  data['t_bc_left'])
+        u_pred_right = self.network(data['x_bc_right'], data['t_bc_right'])
+        loss_bc = mse(u_pred_left,  data['u_bc_left']) + \
+                  mse(u_pred_right, data['u_bc_right'])
+
+        # Wave: velocity IC
+        if self.pde == 'wave' and 'u_ic_dt' in data:
+            x_ic_ = data['x_ic'].clone().requires_grad_(True)
+            t_ic_ = data['t_ic'].clone().requires_grad_(True)
+            u_    = self.network(x_ic_, t_ic_)
+            u_t_  = torch.autograd.grad(u_, t_ic_,
+                        grad_outputs=torch.ones_like(u_),
+                        create_graph=True)[0]
+            loss_ic = loss_ic + mse(u_t_, data['u_ic_dt'])
+
+        # PDE residual loss
+        xf = data['x_f'] if x_f is None else x_f
+        tf = data['t_f'] if t_f is None else t_f
+        xf = xf.clone().requires_grad_(True)
+        tf = tf.clone().requires_grad_(True)
+        f_pred   = self.residual_fn(self.network, xf, tf, **self.pde_params)
+        loss_pde = mse(f_pred, torch.zeros_like(f_pred))
+
+        # Gradient-enhancement terms: ||grad_x r||^2 and ||grad_t r||^2
+        r_x = torch.autograd.grad(f_pred, xf, grad_outputs=torch.ones_like(f_pred),
+                                   create_graph=True, retain_graph=True)[0]
+        r_t = torch.autograd.grad(f_pred, tf, grad_outputs=torch.ones_like(f_pred),
+                                   create_graph=True, retain_graph=True)[0]
+        loss_g = mse(r_x, torch.zeros_like(r_x)) + mse(r_t, torch.zeros_like(r_t))
+
+        total = self.lambda_ic * loss_ic + \
+                self.lambda_bc * loss_bc + \
+                self.lambda_pde * loss_pde + \
+                self.lambda_g * loss_g
+        return total, loss_ic, loss_bc, loss_pde
 
 
 class _BaseFDM:

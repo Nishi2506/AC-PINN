@@ -159,6 +159,9 @@ def main():
         print(f'\nFailed runs: {failed}')
     print('\nMulti-seed run complete.')
 
+    if failed:
+        sys.exit(1)
+
 
 if __name__ == '__main__':
     main()
